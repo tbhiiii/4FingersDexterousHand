@@ -26,6 +26,9 @@ int interval = 10;
 int joystick_x = 0;
 int joystick_y = 0;
 int servoPin[8] = {12, 13, 32, 33, 25, 26, 27, 14};
+int modeSelection;
+int modeAngle;
+int leftORright = 0;
 
 bool isrecorded[10];
 bool protract_button = 0;
@@ -39,6 +42,7 @@ bool reset_button = 0;
 bool angle_changing = 0;
 bool confirm_slot = 0;
 bool hasRecord = 0;
+bool modeHasSelected = 0;
 
 void originalposition();
 void replay(int slot);
@@ -49,7 +53,7 @@ void retract(int finger, int joystick);
 void left(int finger, int joystick);
 void right(int finger, int joystick);
 void turnoffbutton();
-
+void anglelimit(int angle1, int angle2);
 
 BLYNK_WRITE(V0){ protract_button = param.asInt(); if(param.asInt() != 0){ turnoffbutton();}} // Protract
 BLYNK_WRITE(V1){ retract_button = param.asInt(); if(param.asInt() != 0){ turnoffbutton();}} // Retract
@@ -64,17 +68,13 @@ BLYNK_WRITE(V9){ joystick_x = param.asInt(); if(param.asInt() != 0){ turnoffbutt
 BLYNK_WRITE(V10){ finger = param.asInt(); if(param.asInt() != 0){ turnoffbutton();}} // Finger select slider
 BLYNK_WRITE(V11){ joystick_y = param.asInt(); if(param.asInt() != 0){ turnoffbutton();}} // joystick for y axis
 BLYNK_WRITE(V13){ slot = param.asInt(); } // Slot select
-BLYNK_WRITE(V14){ confirm_slot = param.asInt(); } // Confirm slot
-
-
-
-
-
+BLYNK_WRITE(V14){ confirm_slot = param.asInt();} // Confirm slot
+BLYNK_WRITE(V16){ modeSelection = param.asInt();}
 
 void setup() {
   Blynk.begin(auth, ssid, pass);
   Serial.begin(9600);
-  for (int j=0;j<8;j++){ //8 servo
+  for (int j=0; j<8; j++){ //8 servo
     servo[j].attach(servoPin[j], 544, 2400);  //configure which pins are used 
   }
   for (int i = 0; i < 10; i++){
@@ -85,7 +85,22 @@ void setup() {
 
 void loop() {
   Blynk.run();
-  delay(10);
+  switch (modeSelection){
+    case 2:
+    Serial.println("Pls select the button");
+    while(modeSelection == 1){};
+    break;
+    case 1:
+    modeAngle = -5;
+    break;
+    case 0:         //grip
+    modeAngle = 5;
+    break;
+    case -1:        //demo
+    modeAngle = 0;
+    break;
+  }
+
   if (record_button){     //record button is pushed
     if (slot == 0 || confirm_slot == 0) {//wait if user haven't selected any slot
     return;
@@ -102,11 +117,11 @@ void loop() {
     Serial.println("Reset is executed");
     originalposition();
     Serial.println("returned");
-    delay(500);
+    delay(100);
   }else if(exit_button){
     exitProgram();
     Serial.println("returned");
-    delay(500);
+    delay(100);
   }
 
   if (finger != 0){
@@ -125,7 +140,7 @@ void loop() {
       Serial.println("returned");
     }
 
-    if(joystick_y > 0){
+    /*if(joystick_y > 0){
       protract(finger - 1, 10 - joystick_y); //if joystick move slightly, lower value assigned, passing value larger
       Serial.println("returned");
     }else if(joystick_y < 0){
@@ -137,8 +152,7 @@ void loop() {
     }else if(joystick_x < 0){
       left(finger - 1, 10 + joystick_x);
       Serial.println("returned");
-    }
-
+    }*/
   }
 
 
@@ -151,24 +165,23 @@ void loop() {
   }
 }
 
-
 void originalposition(){
-  Serial.println("originalposition is executed");
-  for (int j=0; j<4; j++){ //just easier for angle setting
-    currentPosition[j] = 20;    //all the left servo become 0
-    currentPosition[j+4] = 160;  //all the right servo become 180
-  }
-  angle_changing = 1;         //synchronize to servo motors
-  return;
+Serial.println("originalposition is executed");
+for (int j=0; j<4; j++){ //just easier for angle setting
+  currentPosition[j] = 20;    //all the left servo become 0
+  currentPosition[j+4] = 160;  //all the right servo become 180
+}
+angle_changing = 1;         //synchronize to servo motors
+return;
 }
 
 void protract(int finger, int joystick){
   Serial.println(finger + 1);
   Serial.println("protract is executed");
   currentPosition[finger] = currentPosition[finger] + (interval - joystick);    //passing value is smaller so the increase will be larger
-  currentPosition[finger + 4] = currentPosition[finger + 4] - (interval - joystick) ;
-  angle_changing = 1;
-  delay(500);                                         //avoid too fast changing
+  currentPosition[finger + 4] = currentPosition[finger + 4] - (interval - joystick);
+  anglelimit(interval - joystick, - (interval - joystick)); //return, matrix
+  delay(1000);                                                                   //avoid too fast changing
   return;
 }
 
@@ -177,18 +190,20 @@ void retract(int finger, int joystick){
   Serial.println("retract is executed");
   currentPosition[finger] = currentPosition[finger] - (interval - joystick);
   currentPosition[finger + 4] = currentPosition[finger + 4] + (interval - joystick);
-  angle_changing = 1;
-  delay(500);
+  anglelimit(- (interval - joystick), interval - joystick);
+  delay(1000);
   return;
 }
 
 void left(int finger, int joystick){
+  leftORright = leftORright + 1;
   Serial.println(finger + 1);
   Serial.println("left is executed");
   currentPosition[finger] = currentPosition[finger] + (interval - joystick);
   currentPosition[finger + 4] = currentPosition[finger + 4] + (interval - joystick);
+  anglelimit(interval - joystick, interval - joystick);
   angle_changing = 1;
-  delay(500);
+  delay(1000);
   return;
 }
 
@@ -197,8 +212,8 @@ void right(int finger, int joystick){
   Serial.println("right is executed");
   currentPosition[finger] = currentPosition[finger] - (interval - joystick);
   currentPosition[finger + 4] = currentPosition[finger + 4] - (interval - joystick);
-  angle_changing = 1;
-  delay(500);
+  anglelimit(-(interval - joystick), - (interval - joystick));
+  delay(1000);
   return;
 }
 
@@ -207,10 +222,13 @@ void replay(int slot){
   if (isrecorded[slot - 1]){     //make sure slot have recorded
   //originalposition();
   //delay(1000);
-  for (int i = 0; i < 8; i++){
-    servo[i].write(recordPosition[slot-1][i]);    //minus 1 because the input 1 will be slot[0]
-    currentPosition[i] = recordPosition[slot-1][i];
-    Serial.println(recordPosition[slot-1][i]);
+  for (int i = 0; i < 4; i++){
+    servo[i].write(recordPosition[slot-1][i] + modeAngle);    //minus 1 because the input 1 will be slot[0]
+    servo[i+4].write(recordPosition[slot-1][i+4] - modeAngle); 
+    currentPosition[i] = recordPosition[slot-1][i] + modeAngle;
+    currentPosition[i+4] = recordPosition[slot-1][i+4] - modeAngle;
+    Serial.println(recordPosition[slot-1][i] + modeAngle);
+    Serial.println(recordPosition[slot-1][i+4] - modeAngle);
   }
   }
   else{
@@ -246,4 +264,13 @@ void turnoffbutton(){
   record_button = 0;
   replay_button = 0;
   return;
+}
+
+void anglelimit(int angle1, int angle2){
+  if (currentPosition[finger - 1] >= 0 && currentPosition[finger - 1] <= 180 && currentPosition[finger + 3] >= 0 && currentPosition[finger + 3] <= 180){
+  angle_changing = 1;
+  }else{
+  currentPosition[finger - 1] = currentPosition[finger - 1] + angle1;    //passing value is smaller so the increase will be larger
+  currentPosition[finger + 3] = currentPosition[finger + 3] + angle2;
+  }
 }
