@@ -76,8 +76,7 @@ void setup() {
 /*  for (int i = 0; i < 10; i++){
     isrecorded[i] = false;
   }*/
-  Blynk.virtualWrite(V17, "LCD L1");
-  Blynk.virtualWrite(V18, "LCD L2");
+  Blynk.virtualWrite(V17, "Terminal");
   originalPosition();
 }
 
@@ -131,26 +130,34 @@ void loop() {
   if (finger != 0){
     if(protractButton){    //+-
       Serial.println("protract is executed");
+      Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] protract is executed\n");
       move(interval, -interval);
       Serial.println("returned");
     }else if(retractButton){ //-+
       Serial.println("retract is executed");
+      Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] retract is executed\n");
       move(-interval, +interval);
       Serial.println("returned");
     }else if(leftButton){ //++
       Serial.println("left is executed");
+      Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] left is executed\n");
       leftOrRight++;
       if(leftOrRight > 2){
         Serial.println("left limited");
+        Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] left is limited\n");
+        delay(1000);
       }else{
         move(interval, interval);
         Serial.println("returned");
       }
     }else if(rightButton){ //--
       Serial.println("right is executed");
+      Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] right is limited\n");
       leftOrRight--;
       if(leftOrRight < -2){
         Serial.println("right limited");
+        Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] left is executed\n");
+        delay(1000);
       }else{
         move(-interval, -interval);
         Serial.println("returned");
@@ -163,11 +170,13 @@ void writeAngle(){
   for (int i = 0; i < 8; i++){
     servo[i].write(currentPosition[i]);      //rotate servo motor
     Serial.println(currentPosition[i]);
-  }  
+    Blynk.virtualWrite(V17, "Angle" + String(i+1) + ": " + String(currentPosition[i]) + "\n");
+  }
 }
 
 void originalPosition(){
 Serial.println("originalPosition is executed");
+Blynk.virtualWrite(V17, "originalPosition is executed\n");
 for (int j=0; j<4; j++){ //just easier for angle setting
   currentPosition[j] = 20;    //all the left servo become 0
   currentPosition[j+4] = 160;  //all the right servo become 180
@@ -187,6 +196,7 @@ void move(int a, int b){
 
 void replay(int slot){
   Serial.println("replay is executed");
+  Blynk.virtualWrite(V17, "replay is executed\n");
   if (isRecorded[slot - 1]){     //make sure slot have recorded
     for (int i = 0; i < 4; i++){
       servo[i].write(recordPosition[slot-1][i] + modeAngle);    //minus 1 because the input 1 will be slot[0]
@@ -196,9 +206,16 @@ void replay(int slot){
       Serial.println(recordPosition[slot-1][i] + modeAngle);
       Serial.println(recordPosition[slot-1][i+4] - modeAngle);
     }
+    for (int i = 0; i < 8; i++){
+    //servo[i].write(currentPosition[i]);      //rotate servo motor
+    //Serial.println(currentPosition[i]);
+    Blynk.virtualWrite(V17, "Angle" + String(i+1) + ": " + String(currentPosition[i]) + "\n");
+  } 
   }
   else{
     Serial.println("Slot is not recorded");
+    Blynk.virtualWrite(V17, "Slot is not recorded\n");
+
   }
   turnOffButton();
   return;
@@ -207,10 +224,13 @@ void replay(int slot){
 
 void record(int slot){
   Serial.println("record is executed");
+  Blynk.virtualWrite(V17, "record is executed\n");
   Serial.print("slot ");Serial.print(slot);Serial.println(" is selected");
+  Blynk.virtualWrite(V17, "slot " + String(slot) + " is selected\n");
   for (int i = 0; i < 8; i++){
     recordPosition[slot-1][i] = currentPosition[i];   //record current position in slot-1
     Serial.println(recordPosition[slot - 1][i]);
+    Blynk.virtualWrite(V17, "Angle" + String(i+1) + ": " + String(recordPosition[slot-1][i]) + "\n");
   }
   isRecorded[slot-1] = true;
   turnOffButton();
@@ -219,6 +239,7 @@ void record(int slot){
 
 void exitProgram(){
   Serial.println("exitProgram is executed");
+  Blynk.virtualWrite(V17, "exitProgram is executed\n");
   finger = 0;         //no finger is not chosen so the up/down/left/right and joystick are unabled
   originalPosition();
   return;
