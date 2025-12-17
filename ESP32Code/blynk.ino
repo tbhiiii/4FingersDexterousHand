@@ -1,23 +1,24 @@
-#define BLYNK_TEMPLATE_ID "TMPL6gxKuWvWX"
-#define BLYNK_TEMPLATE_NAME "SERVO MOTOR WITH ESP 32"
-#define BLYNK_AUTH_TOKEN "CY9R3RlWisrlnm-LYmilIkEbOM3ukKot"
+  #define BLYNK_TEMPLATE_ID "TMPL6gxKuWvWX"
+  #define BLYNK_TEMPLATE_NAME "SERVO MOTOR WITH ESP 32"
+  #define BLYNK_AUTH_TOKEN "CY9R3RlWisrlnm-LYmilIkEbOM3ukKot"
 
-#include <ESP32Servo.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <BlynkSimpleEsp32.h>
+  #include <ESP32Servo.h>
+  #include <WiFi.h>
+  #include <WiFiClient.h>
+  #include <BlynkSimpleEsp32.h>
 
-// You should get Auth Token in the Blynk App.
-// Go to the Project Settings (nut icon).
-char auth[] = "CY9R3RlWisrlnm-LYmilIkEbOM3ukKot";
+  // You should get Auth Token in the Blynk App.
+  // Go to the Project Settings (nut icon).
+  char auth[] = "CY9R3RlWisrlnm-LYmilIkEbOM3ukKot";
 
-// Your WiFi credentials.
-// Set password to "" for open networks.
-char ssid[] = "Cctv";
-char pass[] = "uzif849jkd";
+  // Your WiFi credentials.
+  // Set password to "" for open networks.
+  char ssid[] = "Cctv";
+  char pass[] = "uzif849jkd";
 
 Servo servo[8];
 
+WidgetTerminal terminal(V17);
 int finger = 0;
 int slot = 0;
 int currentPosition[8];
@@ -50,7 +51,7 @@ void replay(int slot);
 void record(int slot);
 void exitProgram();
 void turnOffButton();
-void angleLimit(int angle1, int angle2);
+void angleLimit_PR(int angle1, int angle2);
 void move(int a, int b);
 void writeAngle();
 void RPS();
@@ -75,11 +76,13 @@ BLYNK_WRITE(V18){ RPSGame = param.asInt();}
 void setup() {
   Blynk.begin(auth, ssid, pass);
   Serial.begin(9600);
+  terminal.clear();
   for (int j=0; j<8; j++){ //8 servo
     servo[j].attach(servoPin[j], 544, 2400);  //configure which pins are used 
   }
-  Blynk.virtualWrite(V17, "Terminal");
+  terminal.println("Terminal");
   originalPosition();
+  
 }
 
 void loop() {
@@ -102,7 +105,7 @@ void loop() {
   if (RPSGame){
     for (int i = 3; i > 0; i--){
       Serial.println(i);
-      Blynk.virtualWrite(V17, i);
+      terminal.println(i);
       delay(1000);
     }
     RPS();
@@ -139,21 +142,21 @@ void loop() {
   if (finger != 0){
     if(protractButton){    //+-
       Serial.println("protract is executed");
-      Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] protract is executed\n");
+      terminal.println( "[Finger " + String(finger) + "] protract is executed\n");
       move(interval, -interval);
       Serial.println("returned");
     }else if(retractButton){ //-+
       Serial.println("retract is executed");
-      Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] retract is executed\n");
+      terminal.println( "[Finger " + String(finger) + "] retract is executed\n");
       move(-interval, +interval);
       Serial.println("returned");
     }else if(leftButton){ //++
       Serial.println("left is executed");
-      Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] left is executed\n");
+      terminal.println( "[Finger " + String(finger) + "] left is executed\n");
       leftOrRight++;
       if(leftOrRight > 2){
         Serial.println("left limited");
-        Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] left is limited\n");
+        terminal.println( "[Finger " + String(finger) + "] left is limited\n");
         delay(1000);
       }else{
         move(interval, interval);
@@ -161,11 +164,11 @@ void loop() {
       }
     }else if(rightButton){ //--
       Serial.println("right is executed");
-      Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] right is limited\n");
-      leftOrRight--;
+      terminal.println( "[Finger " + String(finger) + "] right is limited\n");
+      leftOrRight--; //limited ++
       if(leftOrRight < -2){
         Serial.println("right limited");
-        Blynk.virtualWrite(V17, "[Finger " + String(finger) + "] left is executed\n");
+        terminal.println( "[Finger " + String(finger) + "] left is executed\n");
         delay(1000);
       }else{
         move(-interval, -interval);
@@ -179,13 +182,13 @@ void writeAngle(){
   for (int i = 0; i < 8; i++){
     servo[i].write(currentPosition[i]);      //rotate servo motor
     Serial.println(currentPosition[i]);
-    Blynk.virtualWrite(V17, "Angle" + String(i+1) + ": " + String(currentPosition[i]) + "\n");
+    terminal.println( "Angle" + String(i+1) + ": " + String(currentPosition[i]) + "\n");
   }
 }
 
 void originalPosition(){
 Serial.println("originalPosition is executed");
-Blynk.virtualWrite(V17, "originalPosition is executed\n");
+terminal.println( "originalPosition is executed\n");
 for (int j=0; j<4; j++){ //just easier for angle setting
   currentPosition[j] = 20;    //all the left servo become 0
   currentPosition[j+4] = 160;  //all the right servo become 180
@@ -198,14 +201,14 @@ void move(int a, int b){
   Serial.println(finger);
   currentPosition[finger - 1] = currentPosition[finger - 1] + a;
   currentPosition[finger + 3] = currentPosition[finger + 3] + b;
-  angleLimit(a, b);
+  angleLimit_PR(a, b);
   delay(1000);
   return;
 }
 
 void replay(int slot){
   Serial.println("replay is executed");
-  Blynk.virtualWrite(V17, "replay is executed\n");
+  terminal.println( "replay is executed\n");
   if (isRecorded[slot - 1]){     //make sure slot have recorded
     for (int i = 0; i < 4; i++){
       servo[i].write(recordPosition[slot-1][i] + modeAngle);    //minus 1 because the input 1 will be slot[0]
@@ -218,12 +221,12 @@ void replay(int slot){
     for (int i = 0; i < 8; i++){
     //servo[i].write(currentPosition[i]);      //rotate servo motor
     //Serial.println(currentPosition[i]);
-    Blynk.virtualWrite(V17, "Angle" + String(i+1) + ": " + String(currentPosition[i]) + "\n");
+    terminal.println( "Angle" + String(i+1) + ": " + String(currentPosition[i]) + "\n");
   } 
   }
   else{
     Serial.println("Slot is not recorded");
-    Blynk.virtualWrite(V17, "Slot is not recorded\n");
+    terminal.println( "Slot is not recorded\n");
 
   }
   turnOffButton();
@@ -233,13 +236,13 @@ void replay(int slot){
 
 void record(int slot){
   Serial.println("record is executed");
-  Blynk.virtualWrite(V17, "record is executed\n");
+  terminal.println( "record is executed\n");
   Serial.print("slot ");Serial.print(slot);Serial.println(" is selected");
-  Blynk.virtualWrite(V17, "slot " + String(slot) + " is selected\n");
+  terminal.println( "slot " + String(slot) + " is selected\n");
   for (int i = 0; i < 8; i++){
     recordPosition[slot-1][i] = currentPosition[i];   //record current position in slot-1
     Serial.println(recordPosition[slot - 1][i]);
-    Blynk.virtualWrite(V17, "Angle" + String(i+1) + ": " + String(recordPosition[slot-1][i]) + "\n");
+    terminal.println( "Angle" + String(i+1) + ": " + String(recordPosition[slot-1][i]) + "\n");
   }
   isRecorded[slot-1] = true;
   turnOffButton();
@@ -248,7 +251,7 @@ void record(int slot){
 
 void exitProgram(){
   Serial.println("exitProgram is executed");
-  Blynk.virtualWrite(V17, "exitProgram is executed\n");
+  terminal.println( "exitProgram is executed\n");
   finger = 0;         //no finger is not chosen so the up/down/left/right and joystick are unabled
   originalPosition();
   return;
@@ -262,8 +265,8 @@ void turnOffButton(){
   return;
 }
 
-void angleLimit(int angle1, int angle2){
-  if (currentPosition[finger - 1] >= 20 && currentPosition[finger - 1] <= 180 && currentPosition[finger + 3] >= 20 && currentPosition[finger + 3] <= 180){
+void angleLimit_PR(int angle1, int angle2){
+  if (currentPosition[finger - 1] >= 20 && currentPosition[finger - 1] <= 180 && currentPosition[finger + 3] >= 0 && currentPosition[finger + 3] <= 160){
   writeAngle();
   }else{
   currentPosition[finger - 1] = currentPosition[finger - 1] - angle1;
@@ -271,6 +274,10 @@ void angleLimit(int angle1, int angle2){
   }
   return;
 }
+
+//void angleLimit_LR(int angle1, int angle2){
+//  if 
+//}
 
 void RPS(){
   randomRPS = random(1,4);
@@ -282,7 +289,7 @@ void RPS(){
       currentPosition[i+4] = 20;
     }
     Serial.println("Rock");
-    Blynk.virtualWrite(V17,"Rock");
+    terminal.println("Rock");
     break;
     case 2:
     //{20, 20, 20, 20, 160, 160, 160, 160};
@@ -291,7 +298,7 @@ void RPS(){
       currentPosition[i+4] = 160;
     }
     Serial.println("Paper");
-    Blynk.virtualWrite(V17,"Paper");   
+    terminal.println("Paper");   
     break;
     case 3:
     //{20, 160, 160, 20, 160, 20, 20, 160};
@@ -303,7 +310,7 @@ void RPS(){
       }
     }
     Serial.println("Scissors");
-    Blynk.virtualWrite(V17,"Scissors");
+    terminal.println("Scissors");
     break; 
   }
   
