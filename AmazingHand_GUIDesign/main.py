@@ -4,6 +4,8 @@ import time
 import urllib.request
 import random
 import socket
+import math
+from collections import deque
 from pathlib import Path
 
 # Check if the current environment uses the newer Tasks API (MediaPipe 0.10+ / Python 3.13+)
@@ -24,12 +26,34 @@ MODEL_PATH = Path(__file__).parent / "models" / "hand_landmarker.task"
 
 # ================= Runtime Tuning Parameters =================
 ENABLE_GPU = False  # Try GPU delegate for Tasks API if available (may require specific hardware setups).
-PINCH_ON_RATIO = 0.28  # Threshold to trigger a pinch (smaller = fingers must be closer).
-PINCH_OFF_RATIO = 0.35  # Threshold to release a pinch. Must be > PINCH_ON_RATIO to create hysteresis (prevents flickering).
-CURSOR_SMOOTHING = 0.45  # 0.0 = no smoothing (jittery), 0.99 = maximum smoothing (laggy).
+CAP_WIDTH = 960  # Match the demo resolution for more stable landmark output.
+CAP_HEIGHT = 540
+MAX_NUM_HANDS = 1  # Reduce hand switching/jitter (demo uses 1).
+MIN_DETECTION_CONFIDENCE = 0.7
+MIN_TRACKING_CONFIDENCE = 0.5
+MIN_PRESENCE_CONFIDENCE = 0.5
+USE_STATIC_IMAGE_MODE = False  # Solutions API only.
+PINCH_ON_RATIO = 0.24  # Threshold to trigger a pinch (smaller = fingers must be closer).
+PINCH_OFF_RATIO = 0.42  # Threshold to release a pinch. Must be > PINCH_ON_RATIO to create hysteresis (prevents flickering).
+CURSOR_SMOOTHING = 0.7  # 0.0 = no smoothing (jittery), 0.99 = maximum smoothing (laggy).
 THUMB_OPEN_RATIO = 0.32  # Threshold for thumb extension. Larger = thumb must be farther from palm to count as open.
 GAME_COUNTDOWN_SEC = 3.0  # Duration of the Rock-Paper-Scissors countdown.
 GAME_REVEAL_SEC = 2.0  # How long the Rock-Paper-Scissors result stays on screen.
+CLICK_COUNTDOWN_SEC = 3.0  # Delay before executing a GUI click action.
+PINCH_STABLE_SEC = 0.12  # Pinch must be held this long to count as a valid click trigger.
+CLICK_COOLDOWN_SEC = 0.5  # Minimum time between click triggers to avoid rapid repeats.
+USE_ONE_EURO = True  # Enable One Euro filter for smoother cursor/pinch without big lag.
+ONE_EURO_MIN_CUTOFF = 1.6  # Lower = smoother, higher = more responsive.
+ONE_EURO_BETA = 0.015  # Higher = less lag during fast motion.
+ONE_EURO_D_CUTOFF = 1.0  # Derivative cutoff for One Euro filter.
+ONE_EURO_PINCH_MIN_CUTOFF = 2.0  # Pinch ratio smoothing baseline.
+ONE_EURO_PINCH_BETA = 0.01  # Pinch ratio responsiveness.
+USE_CURSOR_MEDIAN = True  # Median filter for cursor to suppress jitter spikes.
+CURSOR_MEDIAN_WINDOW = 5  # Number of frames for median filter (odd number recommended).
+CURSOR_DEADZONE_PX = 2  # Ignore tiny movements smaller than this (in pixels).
+CURSOR_MAX_STEP_PX = 24  # Clamp per-frame movement to avoid sudden jumps.
+CURSOR_MAX_STEP_RATIO = 0.7  # Clamp per-frame movement based on palm width (0 to disable).
+USE_PALM_ANCHOR = True  # Stabilize cursor by smoothing palm center + finger offset.
 FLIP_IMAGE = True  # Mirror the webcam feed (highly recommended for intuitive hand control).
 MIMIC_HAND_LABEL = "Left" if FLIP_IMAGE else "Right"  # Determines which hand acts as the master in Mimic mode.
 
@@ -44,6 +68,7 @@ SERIAL_LOG = True  # Print commands to the console for debugging even if transpo
 UDP_ENABLED = True
 UDP_IP = "192.168.1.50"  # The IP address of your ESP32 on the local Wi-Fi network.
 UDP_PORT = 6000  # The port your ESP32 is listening to.
+WEBCAMID =1
 
 # ================= MediaPipe Initialization =================
 if use_tasks_api:
@@ -78,10 +103,10 @@ if use_tasks_api:
     options = mp.tasks.vision.HandLandmarkerOptions(
         base_options=base_options,
         running_mode=mp.tasks.vision.RunningMode.VIDEO,
-        num_hands=2,
-        min_hand_detection_confidence=0.7,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.7,
+        num_hands=MAX_NUM_HANDS,
+        min_hand_detection_confidence=MIN_DETECTION_CONFIDENCE,
+        min_hand_presence_confidence=MIN_PRESENCE_CONFIDENCE,
+        min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
     )
     landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
 else:
@@ -90,9 +115,10 @@ else:
     mp_draw = mp.solutions.drawing_utils
 
     hands = mp_hands.Hands(
-        max_num_hands=2,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7
+        static_image_mode=USE_STATIC_IMAGE_MODE,
+        max_num_hands=MAX_NUM_HANDS,
+        min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+        min_tracking_confidence=MIN_TRACKING_CONFIDENCE
     )
 
 
@@ -215,12 +241,86 @@ def _draw_center_text(img, text, y, scale, color, thickness=2):
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
 
+class _LowPassFilter:
+    def __init__(self, alpha, initial=None):
+        self.alpha = alpha
+        self.s = initial
+
+    def reset(self):
+        self.s = None
+
+    def apply(self, value):
+        if self.s is None:
+            self.s = value
+        else:
+            self.s = self.alpha * value + (1.0 - self.alpha) * self.s
+        return self.s
+
+
+class OneEuroFilter:
+    """
+    One Euro Filter for real-time smoothing with low lag.
+    Reference: http://cristal.univ-lille.fr/~casiez/1euro/
+    """
+
+    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self._x = _LowPassFilter(1.0)
+        self._dx = _LowPassFilter(1.0)
+        self._last = None
+
+    def reset(self):
+        self._x.reset()
+        self._dx.reset()
+        self._last = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def apply(self, value, dt):
+        if dt <= 0:
+            return value
+        if self._last is None:
+            self._last = value
+        dx = (value - self._last) / dt
+        self._last = value
+
+        alpha_d = self._alpha(self.d_cutoff, dt)
+        self._dx.alpha = alpha_d
+        edx = self._dx.apply(dx)
+
+        cutoff = self.min_cutoff + self.beta * abs(edx)
+        alpha = self._alpha(cutoff, dt)
+        self._x.alpha = alpha
+        return self._x.apply(value)
+
+
+def _draw_click_countdown(img, cursor, elapsed, duration):
+    """Draws a Windows-style dwell countdown ring around the cursor."""
+    if cursor is None or duration <= 0:
+        return
+    progress = min(1.0, max(0.0, elapsed / duration))
+    radius = 22
+    thickness = 3
+    base_color = (210, 210, 210)
+    arc_color = (255, 255, 255)
+
+    cv2.circle(img, cursor, radius, base_color, 1)
+    start_angle = -90
+    end_angle = start_angle + (progress * 360.0)
+    cv2.ellipse(img, cursor, (radius, radius), 0, start_angle, end_angle, arc_color, thickness)
+
+
 # ================= OpenCV Webcam Initialization =================
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(WEBCAMID)
 if not cap.isOpened():
     raise RuntimeError("Could not open webcam (index 0).")
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
 start_time = time.perf_counter()
 
 # State variables
@@ -228,9 +328,24 @@ cursor_pos = None
 cursor_smoothing = CURSOR_SMOOTHING
 control_enabled = True
 pinch_active = False
+pinch_hold_start = None
+pinch_stable_emitted = False
+last_click_trigger_time = 0.0
 mimic_mode = False
 last_mimic_state = None
 last_serial_send = 0.0
+last_frame_time = time.perf_counter()
+
+cursor_filter_x = OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+cursor_filter_y = OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+cursor_hist_x = deque(maxlen=CURSOR_MEDIAN_WINDOW)
+cursor_hist_y = deque(maxlen=CURSOR_MEDIAN_WINDOW)
+palm_filter_x = OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+palm_filter_y = OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+offset_filter_x = OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+offset_filter_y = OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF)
+palm_hist_x = deque(maxlen=CURSOR_MEDIAN_WINDOW)
+palm_hist_y = deque(maxlen=CURSOR_MEDIAN_WINDOW)
 
 # RPS Game state machine variables
 game_state = "idle"  # States: "idle", "countdown", "reveal"
@@ -238,6 +353,11 @@ game_start_time = 0.0
 game_user_move = "NONE"
 game_robot_move = "NONE"
 game_result = "NONE"
+
+# Click countdown state
+click_countdown_active = False
+click_countdown_start = 0.0
+click_target = None
 
 # Instantiate UI buttons
 btn_home = VirtualButton(20, 100, 150, 60, "RPS GAME")
@@ -288,6 +408,27 @@ def _is_fist(landmarks):
 def _hand_scale2(landmarks):
     """Calculates palm width squared. Used as a reference scale to normalize distances so gestures work at any depth."""
     return _dist2(landmarks[5], landmarks[17])
+
+
+def _hand_scale_px(landmarks, w, h):
+    """Calculates palm width in pixels for dynamic cursor clamping."""
+    x1, y1 = _to_pixel(landmarks[5], w, h)
+    x2, y2 = _to_pixel(landmarks[17], w, h)
+    return math.hypot(x1 - x2, y1 - y2)
+
+
+def _palm_center_px(landmarks, w, h):
+    """Calculates palm center in pixels using stable palm landmarks."""
+    indices = (0, 5, 9, 13, 17)
+    sx = 0.0
+    sy = 0.0
+    for idx in indices:
+        lm = landmarks[idx]
+        sx += lm.x
+        sy += lm.y
+    cx = sx / len(indices)
+    cy = sy / len(indices)
+    return int(cx * w), int(cy * h)
 
 
 def _thumb_open(landmarks):
@@ -355,17 +496,28 @@ class PinchDetector:
     This prevents the pinch state from rapidly flickering when hovering near the threshold.
     """
 
-    def __init__(self, on_ratio=PINCH_ON_RATIO, off_ratio=PINCH_OFF_RATIO):
+    def __init__(
+        self,
+        on_ratio=PINCH_ON_RATIO,
+        off_ratio=PINCH_OFF_RATIO,
+        use_filter=USE_ONE_EURO,
+        min_cutoff=ONE_EURO_PINCH_MIN_CUTOFF,
+        beta=ONE_EURO_PINCH_BETA,
+        d_cutoff=ONE_EURO_D_CUTOFF,
+    ):
         if on_ratio <= 0 or off_ratio <= on_ratio:
             raise ValueError("Invalid pinch ratios: ensure 0 < on_ratio < off_ratio.")
-        self._on_ratio2 = on_ratio * on_ratio
-        self._off_ratio2 = off_ratio * off_ratio
+        self._on_ratio = on_ratio
+        self._off_ratio = off_ratio
+        self._ratio_filter = OneEuroFilter(min_cutoff, beta, d_cutoff) if use_filter else None
         self._pinched = False
 
     def reset(self):
         self._pinched = False
+        if self._ratio_filter is not None:
+            self._ratio_filter.reset()
 
-    def update(self, landmarks):
+    def update(self, landmarks, dt=None):
         """Processes landmarks. Returns a tuple: (is_currently_pinching, just_pinched_this_frame)"""
         scale2 = _hand_scale2(landmarks)
         if scale2 <= 0:
@@ -374,16 +526,19 @@ class PinchDetector:
 
         # Calculate squared distance between thumb tip and index tip, normalized by hand scale
         ratio2 = _dist2(landmarks[4], landmarks[8]) / scale2
+        ratio = math.sqrt(ratio2)
+        if self._ratio_filter is not None and dt is not None:
+            ratio = self._ratio_filter.apply(ratio, dt)
 
         if not self._pinched:
             # If not pinching, ratio must cross the tighter ON threshold to trigger
-            if ratio2 < self._on_ratio2:
+            if ratio < self._on_ratio:
                 self._pinched = True
                 return True, True
             return False, False
 
         # If already pinching, ratio must cross the looser OFF threshold to release
-        if ratio2 > self._off_ratio2:
+        if ratio > self._off_ratio:
             self._pinched = False
         return self._pinched, False
 
@@ -432,8 +587,11 @@ while True:
     if FLIP_IMAGE:
         img = cv2.flip(img, 1)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_rgb.flags.writeable = False
     h, w, _ = img.shape
     now = time.perf_counter()
+    dt = max(1e-6, now - last_frame_time)
+    last_frame_time = now
 
     # Reset pinch state every frame; True only if hand is detected and pinching
     pinch_active = False
@@ -481,6 +639,18 @@ while True:
     if control_landmarks is None:
         cursor_pos = None
         pinch_detector.reset()
+        pinch_hold_start = None
+        pinch_stable_emitted = False
+        cursor_filter_x.reset()
+        cursor_filter_y.reset()
+        cursor_hist_x.clear()
+        cursor_hist_y.clear()
+        palm_filter_x.reset()
+        palm_filter_y.reset()
+        offset_filter_x.reset()
+        offset_filter_y.reset()
+        palm_hist_x.clear()
+        palm_hist_y.clear()
     else:
         # Check open/closed palm to pause/resume control (only in idle mode)
         if game_state == "idle" and not mimic_mode:
@@ -492,44 +662,148 @@ while True:
         # Allow pinching if control is enabled, or if we are actively playing a game or mimicking
         pinch_allowed = control_enabled or mimic_mode or game_state != "idle"
         if pinch_allowed:
-            pinch_active, just_pinched = pinch_detector.update(control_landmarks)
+            pinch_active, just_pinched = pinch_detector.update(control_landmarks, dt)
         else:
             pinch_detector.reset()
 
-        # Update cursor position using exponential moving average (smoothing)
-        if cursor_pos is None:
-            cursor_pos = index_tip
+        # Update cursor position using One Euro filter or exponential moving average (smoothing)
+        raw_x, raw_y = index_tip
+        palm_x, palm_y = _palm_center_px(control_landmarks, w, h)
+        if USE_CURSOR_MEDIAN:
+            cursor_hist_x.append(raw_x)
+            cursor_hist_y.append(raw_y)
+            xs = sorted(cursor_hist_x)
+            ys = sorted(cursor_hist_y)
+            mid = len(xs) // 2
+            raw_x = xs[mid]
+            raw_y = ys[mid]
+            palm_hist_x.append(palm_x)
+            palm_hist_y.append(palm_y)
+            pxs = sorted(palm_hist_x)
+            pys = sorted(palm_hist_y)
+            midp = len(pxs) // 2
+            palm_x = pxs[midp]
+            palm_y = pys[midp]
+
+        if USE_PALM_ANCHOR:
+            off_x = raw_x - palm_x
+            off_y = raw_y - palm_y
+            if USE_ONE_EURO:
+                spx = palm_filter_x.apply(palm_x, dt)
+                spy = palm_filter_y.apply(palm_y, dt)
+                sox = offset_filter_x.apply(off_x, dt)
+                soy = offset_filter_y.apply(off_y, dt)
+                new_x = int(spx + sox)
+                new_y = int(spy + soy)
+            else:
+                new_x = palm_x + off_x
+                new_y = palm_y + off_y
         else:
-            cx = int(cursor_pos[0] * (1 - cursor_smoothing) + index_tip[0] * cursor_smoothing)
-            cy = int(cursor_pos[1] * (1 - cursor_smoothing) + index_tip[1] * cursor_smoothing)
-            cursor_pos = (cx, cy)
+            if USE_ONE_EURO:
+                fx = cursor_filter_x.apply(raw_x, dt)
+                fy = cursor_filter_y.apply(raw_y, dt)
+                new_x = int(fx)
+                new_y = int(fy)
+            else:
+                if cursor_pos is None:
+                    new_x, new_y = raw_x, raw_y
+                else:
+                    new_x = int(cursor_pos[0] * (1 - cursor_smoothing) + raw_x * cursor_smoothing)
+                    new_y = int(cursor_pos[1] * (1 - cursor_smoothing) + raw_y * cursor_smoothing)
+
+        if cursor_pos is not None:
+            dx = new_x - cursor_pos[0]
+            dy = new_y - cursor_pos[1]
+            if CURSOR_DEADZONE_PX > 0 and abs(dx) < CURSOR_DEADZONE_PX and abs(dy) < CURSOR_DEADZONE_PX:
+                new_x, new_y = cursor_pos
+            else:
+                step = math.hypot(dx, dy)
+                max_step = CURSOR_MAX_STEP_PX
+                if CURSOR_MAX_STEP_RATIO > 0:
+                    palm_w = _hand_scale_px(control_landmarks, w, h)
+                    if palm_w > 0:
+                        ratio_step = palm_w * CURSOR_MAX_STEP_RATIO
+                        if max_step > 0:
+                            max_step = min(max_step, ratio_step)
+                        else:
+                            max_step = ratio_step
+                if max_step > 0 and step > max_step:
+                    scale = max_step / step
+                    new_x = int(cursor_pos[0] + dx * scale)
+                    new_y = int(cursor_pos[1] + dy * scale)
+
+        cursor_pos = (new_x, new_y)
+
+    # Pinch stability filtering (reduces jitter-triggered clicks)
+    stable_pinch = False
+    if pinch_active:
+        if pinch_hold_start is None:
+            pinch_hold_start = now
+        if (not pinch_stable_emitted) and (now - pinch_hold_start) >= PINCH_STABLE_SEC:
+            pinch_stable_emitted = True
+            stable_pinch = True
+    else:
+        pinch_hold_start = None
+        pinch_stable_emitted = False
 
     # ================= GUI Update & Logic =================
 
-    # Check RPS Game Button
-    if btn_home.update(cursor_pos, pinch_active, just_pinched):
-        game_state = "countdown"
-        game_start_time = now
-        game_user_move = "NONE"
-        game_robot_move = "NONE"
-        game_result = "NONE"
-        if mimic_mode:
-            mimic_mode = False
-            _send_cmd("MIMIC:STOP")
-        _send_cmd("MODE:GAME")
+    # Update button hover states (click is handled via countdown)
+    btn_home.update(cursor_pos, pinch_active, False)
+    btn_mode.update(cursor_pos, pinch_active, False)
 
-    # Check Mimic Mode Button
-    if btn_mode.update(cursor_pos, pinch_active, just_pinched):
-        mimic_mode = not mimic_mode
-        game_state = "idle"
-        game_user_move = "NONE"
-        game_robot_move = "NONE"
-        game_result = "NONE"
-        if mimic_mode:
-            _send_cmd("MODE:MIMIC")
-        else:
-            _send_cmd("MIMIC:STOP")
-            _send_cmd("MODE:IDLE")
+    # Start click countdown on stable pinch (with cooldown)
+    if (not click_countdown_active
+            and stable_pinch
+            and (now - last_click_trigger_time) >= CLICK_COOLDOWN_SEC):
+        if btn_home.is_hovered:
+            click_countdown_active = True
+            click_countdown_start = now
+            click_target = "home"
+            last_click_trigger_time = now
+        elif btn_mode.is_hovered:
+            click_countdown_active = True
+            click_countdown_start = now
+            click_target = "mode"
+            last_click_trigger_time = now
+
+    # Handle click countdown progression
+    if click_countdown_active:
+        cancel_countdown = cursor_pos is None
+        if click_target == "home" and not btn_home.is_hovered:
+            cancel_countdown = True
+        if click_target == "mode" and not btn_mode.is_hovered:
+            cancel_countdown = True
+        if not pinch_active:
+            cancel_countdown = True
+
+        if cancel_countdown:
+            click_countdown_active = False
+            click_target = None
+        elif (now - click_countdown_start) >= CLICK_COUNTDOWN_SEC:
+            if click_target == "home":
+                game_state = "countdown"
+                game_start_time = now
+                game_user_move = "NONE"
+                game_robot_move = "NONE"
+                game_result = "NONE"
+                if mimic_mode:
+                    mimic_mode = False
+                    _send_cmd("MIMIC:STOP")
+                _send_cmd("MODE:GAME")
+            elif click_target == "mode":
+                mimic_mode = not mimic_mode
+                game_state = "idle"
+                game_user_move = "NONE"
+                game_robot_move = "NONE"
+                game_result = "NONE"
+                if mimic_mode:
+                    _send_cmd("MODE:MIMIC")
+                else:
+                    _send_cmd("MIMIC:STOP")
+                    _send_cmd("MODE:IDLE")
+            click_countdown_active = False
+            click_target = None
 
     # State Machine: RPS GAME COUNTDOWN
     if game_state == "countdown":
@@ -599,6 +873,8 @@ while True:
     if cursor_pos is not None:
         cursor_color = (0, 0, 255) if pinch_active else (0, 255, 0)  # BGR
         cv2.circle(img, cursor_pos, 10, cursor_color, -1 if pinch_active else 2)
+        if click_countdown_active:
+            _draw_click_countdown(img, cursor_pos, now - click_countdown_start, CLICK_COUNTDOWN_SEC)
 
     # Draw top-left status texts
     status = "ENABLED" if control_enabled else "PAUSED"
