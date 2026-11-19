@@ -1,6 +1,6 @@
 # Hand Tracking Parameter Tuning Guide
 
-This guide lists practical tuning ranges and how each knob affects stability vs. responsiveness. Use it for both `main.py` and `main_v2.py`.
+This guide lists practical tuning ranges and how each knob affects stability vs. responsiveness. Applies to `main_v2.py`.
 
 ## Quick Start (Stable but not obviously slow)
 Set these first and test:
