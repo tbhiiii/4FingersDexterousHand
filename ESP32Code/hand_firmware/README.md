@@ -10,16 +10,18 @@ ESP32 firmware for [protocol v1](../../docs/protocol.md). It runs USB serial at 
 | `secrets.example.h` | Copy it to `secrets.h` (gitignored). Leave `WIFI_SSID` empty to use serial only. |
 | `sketch.yaml` | Default FQBN `esp32:esp32:esp32` |
 
-Tested with core `esp32:esp32` 3.3.12 and the libraries `ESP32Servo` 3.2.1, `Adafruit INA219` 1.2.3 and `Adafruit BusIO` 1.17.4:
+Tested with core `esp32:esp32` 3.3.12 and the libraries `Adafruit PWM Servo Driver Library` 3.0.3, `Adafruit INA219` 1.2.3 and `Adafruit BusIO` 1.17.4:
 
 ```powershell
 $cli = "$env:LOCALAPPDATA\Programs\arduino-cli\arduino-cli.exe"
-& $cli lib install "ESP32Servo@3.2.1" "Adafruit INA219@1.2.3"
+& $cli lib install "Adafruit PWM Servo Driver Library@3.0.3" "Adafruit INA219@1.2.3"
 Copy-Item secrets.example.h secrets.h   # then edit
 & $cli compile .
 & $cli upload -p COM3 .
 & $cli monitor -p COM3 -c baudrate=115200   # type PING, expect PONG v1
 ```
+
+Wiring: servos on PCA9685 channels 0–7 (servo index = channel), servo power on the PCA9685 `V+` terminal. Two I2C buses, so both boards keep the default address `0x40` and nothing needs soldering: PCA9685 on SDA 21 / SCL 22, INA219 on SDA 18 / SCL 19. Both boards' `VCC` to ESP32 3V3, all grounds common. If the PCA9685 doesn't answer at boot, serial prints `INFO:NOPCA9685` and nothing moves.
 
 Done:
 - `PING`, `A:`, `HOME`, `STOP`, `STATUS` and `ERR:`, with angles clamped.
