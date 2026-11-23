@@ -1,0 +1,3 @@
+# Defaults for arduino-cli, so `compile` and `upload` need no --fqbn.
+# Tested with core esp32:esp32 3.3.12 and libraries Adafruit PWM Servo Driver 3.0.3 and Adafruit INA219 1.2.3 (see README.md).
+default_fqbn: esp32:esp32:esp32

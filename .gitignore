@@ -1,4 +1,7 @@
 /lxmusic-rpc.js
 /.idea
 /hand-gesture-recognition-using-mediapipe
-/.gitignore
+secrets.h
+__pycache__/
+.venv/
+build/

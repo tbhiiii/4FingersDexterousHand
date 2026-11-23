@@ -10,6 +10,10 @@ from pathlib import Path
 import cv2 as cv
 import mediapipe as mp
 
+import hand_model
+import mimic
+import protocol
+
 try:
     import serial  # type: ignore
 except Exception:
@@ -60,18 +64,24 @@ CLICK_COUNTDOWN_SEC = 3.0
 GAME_COUNTDOWN_SEC = 3.0
 GAME_REVEAL_SEC = 2.0
 
+# Handshake: open, wait, close with current limit (firmware GRIP), hold, then HOME.
+HANDSHAKE_OPEN_SEC = 2.0
+HANDSHAKE_GRIP_SEC = 3.0  # time from GRIP to release, closing included
+HANDSHAKE_HEARTBEAT_SEC = 0.5  # firmware watchdog cancels GRIP after 2 s of silence
+# shortcut: guess until the INA219 is fitted and measured; set from a real squeeze test.
+HANDSHAKE_LIMIT_MA = 600
+HANDSHAKE_STEP_DEG = 2
+
 FLIP_IMAGE = True
 MIMIC_HAND_LABEL = "Left" if FLIP_IMAGE else "Right"
 
 # ================= Transport Configuration (ESP32) =================
-CONTROL_TRANSPORT = "udp"  # "serial" | "udp" | "both"
-SERIAL_ENABLED = False
+CONTROL_TRANSPORT = "udp"  # "serial" | "udp" | "both": the only transport switch
 SERIAL_PORT = "COM3"
 SERIAL_BAUD = 115200
 SERIAL_SEND_INTERVAL = 0.08
 SERIAL_LOG = True
 
-UDP_ENABLED = True
 UDP_IP = "192.168.1.50"
 UDP_PORT = 6000
 WEBCAMID = 0
@@ -86,7 +96,12 @@ def get_args():
     parser.add_argument("--use_static_image_mode", action="store_true")
     parser.add_argument("--min_detection_confidence", type=float, default=MIN_DETECTION_CONFIDENCE)
     parser.add_argument("--min_tracking_confidence", type=float, default=MIN_TRACKING_CONFIDENCE)
+    parser.add_argument("--target", choices=("hw", "sim", "both"), default="hw",
+                        help="hw: ESP32 over UDP/serial, sim: MuJoCo twin, both: mirror to both")
     return parser.parse_args()
+
+
+SIM = None  # sim.SimHand when --target includes sim; gets every line _send_cmd sends
 
 
 def _use_serial():
@@ -98,18 +113,30 @@ def _use_udp():
 
 
 def _send_cmd(cmd, serial_port, udp_socket):
+    if SIM is not None:
+        SIM.handle_line(cmd)
+    if SIM is not None and serial_port is None and udp_socket is None:
+        return  # sim-only run
     sent = False
+    data = (cmd + "\n").encode("ascii", errors="ignore")
+    # serial.SerialException subclasses OSError, so one except covers a pulled USB cable and a dead network.
     if _use_serial():
         if serial_port is not None:
-            serial_port.write((cmd + "\n").encode("ascii", errors="ignore"))
-            sent = True
+            try:
+                serial_port.write(data)
+                sent = True
+            except OSError as e:
+                print(f"[SERIAL ERROR] {cmd}: {e}")
         elif SERIAL_LOG:
             print(f"[SERIAL DISABLED] {cmd}")
 
     if _use_udp():
         if udp_socket is not None:
-            udp_socket.sendto((cmd + "\n").encode("ascii", errors="ignore"), (UDP_IP, UDP_PORT))
-            sent = True
+            try:
+                udp_socket.sendto(data, (UDP_IP, UDP_PORT))
+                sent = True
+            except OSError as e:
+                print(f"[UDP ERROR] {cmd}: {e}")
         elif SERIAL_LOG:
             print(f"[UDP DISABLED] {cmd}")
 
@@ -402,7 +429,12 @@ class PinchDetector:
 
 
 def main():
+    global SIM
     args = get_args()
+    use_hw = args.target in ("hw", "both")
+    if args.target in ("sim", "both"):
+        import sim  # needs mujoco; only loaded when asked for
+        SIM = sim.SimHand()
 
     landmarker = None
     mp_hands = None
@@ -460,18 +492,27 @@ def main():
     start_time = time.perf_counter()
 
     serial_port = None
-    if SERIAL_ENABLED and _use_serial():
+    if use_hw and _use_serial():
         if serial is None:
-            raise RuntimeError("pyserial is not installed. Install it or set SERIAL_ENABLED = False.")
+            raise RuntimeError('pyserial is not installed. Install it or set CONTROL_TRANSPORT = "udp".')
         serial_port = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0)
 
     udp_socket = None
-    if UDP_ENABLED and _use_udp():
+    if use_hw and _use_udp():
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_socket.setblocking(False)
 
     btn_home = VirtualButton(20, 100, 150, 60, "RPS GAME")
     btn_mode = VirtualButton(20, 180, 150, 60, "MIMIC MODE")
+    btn_pose = VirtualButton(20, 260, 150, 60, "NEXT POSE")
+    btn_shake = VirtualButton(20, 340, 150, 60, "HANDSHAKE")
+    pose_index = -1
+    shake_state = "idle"  # idle | opening | gripping
+    shake_start = 0.0
+    last_heartbeat = 0.0
+
+    def send_pose(name):
+        _send_cmd(protocol.angles(hand_model.pose_angles(name)), serial_port, udp_socket)
 
     cursor_pos = None
     control_enabled = True
@@ -480,7 +521,7 @@ def main():
     pinch_stable_emitted = False
     last_click_trigger_time = 0.0
     mimic_mode = False
-    last_mimic_state = None
+    flex_filters = [OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF) for _ in hand_model.FINGERS]
     last_serial_send = 0.0
 
     game_state = "idle"
@@ -506,310 +547,359 @@ def main():
     palm_hist_y = deque(maxlen=CURSOR_MEDIAN_WINDOW)
     last_frame_time = time.perf_counter()
 
-    while True:
-        ret, image = cap.read()
-        if not ret:
-            break
-        if FLIP_IMAGE:
-            image = cv.flip(image, 1)
-        debug_image = image
-        image_rgb = cv.cvtColor(debug_image, cv.COLOR_BGR2RGB)
-        image_rgb.flags.writeable = False
+    try:
+        while True:
+            ret, image = cap.read()
+            if not ret:
+                break
+            if FLIP_IMAGE:
+                image = cv.flip(image, 1)
+            debug_image = image
+            image_rgb = cv.cvtColor(debug_image, cv.COLOR_BGR2RGB)
+            image_rgb.flags.writeable = False
 
-        h, w, _ = debug_image.shape
-        now = time.perf_counter()
-        dt = max(1e-6, now - last_frame_time)
-        last_frame_time = now
+            h, w, _ = debug_image.shape
+            now = time.perf_counter()
+            dt = max(1e-6, now - last_frame_time)
+            last_frame_time = now
+            if SIM is not None:
+                SIM.step(min(dt, 0.1))  # cap so a slow frame doesn't stall the GUI
 
-        pinch_active = False
-        just_pinched = False
-        hands_info = []
+            pinch_active = False
+            just_pinched = False
+            hands_info = []
 
-        if use_tasks_api:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
-            timestamp_ms = int((time.perf_counter() - start_time) * 1000)
-            results = landmarker.detect_for_video(mp_image, timestamp_ms)
-            if results.hand_landmarks:
-                for idx, hand_landmarks in enumerate(results.hand_landmarks):
-                    mp.tasks.vision.drawing_utils.draw_landmarks(
-                        debug_image,
-                        hand_landmarks,
-                        mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS,
-                    )
-                    label = None
-                    if hasattr(results, "handedness") and results.handedness and idx < len(results.handedness):
-                        label = _label_from_classification_list(results.handedness[idx])
-                    hands_info.append({"landmarks": hand_landmarks, "label": label})
-        else:
-            results = hands.process(image_rgb)
-            if results.multi_hand_landmarks:
-                for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-                    mp_draw.draw_landmarks(debug_image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                    label = None
-                    if results.multi_handedness and idx < len(results.multi_handedness):
-                        label = _label_from_classification_list(results.multi_handedness[idx])
-                    hands_info.append({"landmarks": hand_landmarks.landmark, "label": label})
-
-        control_landmarks, index_tip, control_label = _select_control_hand(hands_info, cursor_pos, w, h)
-        if control_landmarks is None:
-            cursor_pos = None
-            pinch_detector.reset()
-            pinch_hold_start = None
-            pinch_stable_emitted = False
-            cursor_filter_x.reset()
-            cursor_filter_y.reset()
-            palm_filter_x.reset()
-            palm_filter_y.reset()
-            offset_filter_x.reset()
-            offset_filter_y.reset()
-            cursor_hist_x.clear()
-            cursor_hist_y.clear()
-            palm_hist_x.clear()
-            palm_hist_y.clear()
-        else:
-            if game_state == "idle" and not mimic_mode:
-                if _is_open_hand(control_landmarks):
-                    control_enabled = True
-                elif _is_fist(control_landmarks):
-                    control_enabled = False
-
-            pinch_allowed = control_enabled or mimic_mode or game_state != "idle"
-            if pinch_allowed:
-                pinch_active, just_pinched = pinch_detector.update(control_landmarks, dt)
+            if use_tasks_api:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+                timestamp_ms = int((time.perf_counter() - start_time) * 1000)
+                results = landmarker.detect_for_video(mp_image, timestamp_ms)
+                if results.hand_landmarks:
+                    for idx, hand_landmarks in enumerate(results.hand_landmarks):
+                        mp.tasks.vision.drawing_utils.draw_landmarks(
+                            debug_image,
+                            hand_landmarks,
+                            mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS,
+                        )
+                        label = None
+                        if hasattr(results, "handedness") and results.handedness and idx < len(results.handedness):
+                            label = _label_from_classification_list(results.handedness[idx])
+                        hands_info.append({"landmarks": hand_landmarks, "label": label})
             else:
+                results = hands.process(image_rgb)
+                if results.multi_hand_landmarks:
+                    for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                        mp_draw.draw_landmarks(debug_image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                        label = None
+                        if results.multi_handedness and idx < len(results.multi_handedness):
+                            label = _label_from_classification_list(results.multi_handedness[idx])
+                        hands_info.append({"landmarks": hand_landmarks.landmark, "label": label})
+
+            control_landmarks, index_tip, control_label = _select_control_hand(hands_info, cursor_pos, w, h)
+            if control_landmarks is None:
+                cursor_pos = None
                 pinch_detector.reset()
-
-            raw_x, raw_y = index_tip
-            palm_x, palm_y = _palm_center_px(control_landmarks, w, h)
-            if USE_CURSOR_MEDIAN:
-                cursor_hist_x.append(raw_x)
-                cursor_hist_y.append(raw_y)
-                xs = sorted(cursor_hist_x)
-                ys = sorted(cursor_hist_y)
-                mid = len(xs) // 2
-                raw_x = xs[mid]
-                raw_y = ys[mid]
-                palm_hist_x.append(palm_x)
-                palm_hist_y.append(palm_y)
-                pxs = sorted(palm_hist_x)
-                pys = sorted(palm_hist_y)
-                midp = len(pxs) // 2
-                palm_x = pxs[midp]
-                palm_y = pys[midp]
-
-            if USE_PALM_ANCHOR:
-                off_x = raw_x - palm_x
-                off_y = raw_y - palm_y
-                if USE_ONE_EURO:
-                    spx = palm_filter_x.apply(palm_x, dt)
-                    spy = palm_filter_y.apply(palm_y, dt)
-                    sox = offset_filter_x.apply(off_x, dt)
-                    soy = offset_filter_y.apply(off_y, dt)
-                    new_x = int(spx + sox)
-                    new_y = int(spy + soy)
-                else:
-                    new_x = palm_x + off_x
-                    new_y = palm_y + off_y
+                pinch_hold_start = None
+                pinch_stable_emitted = False
+                cursor_filter_x.reset()
+                cursor_filter_y.reset()
+                palm_filter_x.reset()
+                palm_filter_y.reset()
+                offset_filter_x.reset()
+                offset_filter_y.reset()
+                cursor_hist_x.clear()
+                cursor_hist_y.clear()
+                palm_hist_x.clear()
+                palm_hist_y.clear()
             else:
-                if USE_ONE_EURO:
-                    fx = cursor_filter_x.apply(raw_x, dt)
-                    fy = cursor_filter_y.apply(raw_y, dt)
-                    new_x = int(fx)
-                    new_y = int(fy)
+                if game_state == "idle" and not mimic_mode:
+                    if _is_open_hand(control_landmarks):
+                        control_enabled = True
+                    elif _is_fist(control_landmarks):
+                        control_enabled = False
+
+                pinch_allowed = control_enabled or mimic_mode or game_state != "idle"
+                if pinch_allowed:
+                    pinch_active, just_pinched = pinch_detector.update(control_landmarks, dt)
                 else:
-                    if cursor_pos is None:
-                        new_x, new_y = raw_x, raw_y
+                    pinch_detector.reset()
+
+                raw_x, raw_y = index_tip
+                palm_x, palm_y = _palm_center_px(control_landmarks, w, h)
+                if USE_CURSOR_MEDIAN:
+                    cursor_hist_x.append(raw_x)
+                    cursor_hist_y.append(raw_y)
+                    xs = sorted(cursor_hist_x)
+                    ys = sorted(cursor_hist_y)
+                    mid = len(xs) // 2
+                    raw_x = xs[mid]
+                    raw_y = ys[mid]
+                    palm_hist_x.append(palm_x)
+                    palm_hist_y.append(palm_y)
+                    pxs = sorted(palm_hist_x)
+                    pys = sorted(palm_hist_y)
+                    midp = len(pxs) // 2
+                    palm_x = pxs[midp]
+                    palm_y = pys[midp]
+
+                if USE_PALM_ANCHOR:
+                    off_x = raw_x - palm_x
+                    off_y = raw_y - palm_y
+                    if USE_ONE_EURO:
+                        spx = palm_filter_x.apply(palm_x, dt)
+                        spy = palm_filter_y.apply(palm_y, dt)
+                        sox = offset_filter_x.apply(off_x, dt)
+                        soy = offset_filter_y.apply(off_y, dt)
+                        new_x = int(spx + sox)
+                        new_y = int(spy + soy)
                     else:
-                        new_x = int(cursor_pos[0] * (1 - CURSOR_SMOOTHING) + raw_x * CURSOR_SMOOTHING)
-                        new_y = int(cursor_pos[1] * (1 - CURSOR_SMOOTHING) + raw_y * CURSOR_SMOOTHING)
-
-            if cursor_pos is not None:
-                dx = new_x - cursor_pos[0]
-                dy = new_y - cursor_pos[1]
-                if CURSOR_DEADZONE_PX > 0 and abs(dx) < CURSOR_DEADZONE_PX and abs(dy) < CURSOR_DEADZONE_PX:
-                    new_x, new_y = cursor_pos
+                        new_x = palm_x + off_x
+                        new_y = palm_y + off_y
                 else:
-                    step = math.hypot(dx, dy)
-                    max_step = CURSOR_MAX_STEP_PX
-                    if CURSOR_MAX_STEP_RATIO > 0:
-                        palm_w = _hand_scale_px(control_landmarks, w, h)
-                        if palm_w > 0:
-                            ratio_step = palm_w * CURSOR_MAX_STEP_RATIO
-                            if max_step > 0:
-                                max_step = min(max_step, ratio_step)
-                            else:
-                                max_step = ratio_step
-                    if max_step > 0 and step > max_step:
-                        scale = max_step / step
-                        new_x = int(cursor_pos[0] + dx * scale)
-                        new_y = int(cursor_pos[1] + dy * scale)
+                    if USE_ONE_EURO:
+                        fx = cursor_filter_x.apply(raw_x, dt)
+                        fy = cursor_filter_y.apply(raw_y, dt)
+                        new_x = int(fx)
+                        new_y = int(fy)
+                    else:
+                        if cursor_pos is None:
+                            new_x, new_y = raw_x, raw_y
+                        else:
+                            new_x = int(cursor_pos[0] * (1 - CURSOR_SMOOTHING) + raw_x * CURSOR_SMOOTHING)
+                            new_y = int(cursor_pos[1] * (1 - CURSOR_SMOOTHING) + raw_y * CURSOR_SMOOTHING)
 
-            cursor_pos = (new_x, new_y)
+                if cursor_pos is not None:
+                    dx = new_x - cursor_pos[0]
+                    dy = new_y - cursor_pos[1]
+                    if CURSOR_DEADZONE_PX > 0 and abs(dx) < CURSOR_DEADZONE_PX and abs(dy) < CURSOR_DEADZONE_PX:
+                        new_x, new_y = cursor_pos
+                    else:
+                        step = math.hypot(dx, dy)
+                        max_step = CURSOR_MAX_STEP_PX
+                        if CURSOR_MAX_STEP_RATIO > 0:
+                            palm_w = _hand_scale_px(control_landmarks, w, h)
+                            if palm_w > 0:
+                                ratio_step = palm_w * CURSOR_MAX_STEP_RATIO
+                                if max_step > 0:
+                                    max_step = min(max_step, ratio_step)
+                                else:
+                                    max_step = ratio_step
+                        if max_step > 0 and step > max_step:
+                            scale = max_step / step
+                            new_x = int(cursor_pos[0] + dx * scale)
+                            new_y = int(cursor_pos[1] + dy * scale)
 
-        stable_pinch = False
-        if pinch_active:
-            if pinch_hold_start is None:
-                pinch_hold_start = now
-            if (not pinch_stable_emitted) and (now - pinch_hold_start) >= PINCH_STABLE_SEC:
-                pinch_stable_emitted = True
-                stable_pinch = True
-        else:
-            pinch_hold_start = None
-            pinch_stable_emitted = False
+                cursor_pos = (new_x, new_y)
 
-        btn_home.update(cursor_pos, pinch_active)
-        btn_mode.update(cursor_pos, pinch_active)
+            stable_pinch = False
+            if pinch_active:
+                if pinch_hold_start is None:
+                    pinch_hold_start = now
+                if (not pinch_stable_emitted) and (now - pinch_hold_start) >= PINCH_STABLE_SEC:
+                    pinch_stable_emitted = True
+                    stable_pinch = True
+            else:
+                pinch_hold_start = None
+                pinch_stable_emitted = False
 
-        if (not click_countdown_active
-                and stable_pinch
-                and (now - last_click_trigger_time) >= CLICK_COOLDOWN_SEC):
-            if btn_home.is_hovered:
-                click_countdown_active = True
-                click_countdown_start = now
-                click_target = "home"
-                last_click_trigger_time = now
-            elif btn_mode.is_hovered:
-                click_countdown_active = True
-                click_countdown_start = now
-                click_target = "mode"
-                last_click_trigger_time = now
+            btn_home.update(cursor_pos, pinch_active)
+            btn_mode.update(cursor_pos, pinch_active)
+            btn_pose.update(cursor_pos, pinch_active)
+            btn_shake.update(cursor_pos, pinch_active)
 
-        if click_countdown_active:
-            cancel_countdown = cursor_pos is None
-            if click_target == "home" and not btn_home.is_hovered:
-                cancel_countdown = True
-            if click_target == "mode" and not btn_mode.is_hovered:
-                cancel_countdown = True
-            if not pinch_active:
-                cancel_countdown = True
+            if (not click_countdown_active
+                    and stable_pinch
+                    and (now - last_click_trigger_time) >= CLICK_COOLDOWN_SEC):
+                if btn_home.is_hovered:
+                    click_countdown_active = True
+                    click_countdown_start = now
+                    click_target = "home"
+                    last_click_trigger_time = now
+                elif btn_mode.is_hovered:
+                    click_countdown_active = True
+                    click_countdown_start = now
+                    click_target = "mode"
+                    last_click_trigger_time = now
+                elif btn_pose.is_hovered:
+                    click_countdown_active = True
+                    click_countdown_start = now
+                    click_target = "pose"
+                    last_click_trigger_time = now
+                elif btn_shake.is_hovered:
+                    click_countdown_active = True
+                    click_countdown_start = now
+                    click_target = "shake"
+                    last_click_trigger_time = now
 
-            if cancel_countdown:
-                click_countdown_active = False
-                click_target = None
-            elif (now - click_countdown_start) >= CLICK_COUNTDOWN_SEC:
-                if click_target == "home":
-                    game_state = "countdown"
-                    game_start_time = now
-                    game_user_move = "NONE"
-                    game_robot_move = "NONE"
-                    game_result = "NONE"
-                    if mimic_mode:
+            if click_countdown_active:
+                cancel_countdown = cursor_pos is None
+                if click_target == "home" and not btn_home.is_hovered:
+                    cancel_countdown = True
+                if click_target == "mode" and not btn_mode.is_hovered:
+                    cancel_countdown = True
+                if click_target == "pose" and not btn_pose.is_hovered:
+                    cancel_countdown = True
+                if click_target == "shake" and not btn_shake.is_hovered:
+                    cancel_countdown = True
+                if not pinch_active:
+                    cancel_countdown = True
+
+                if cancel_countdown:
+                    click_countdown_active = False
+                    click_target = None
+                elif (now - click_countdown_start) >= CLICK_COUNTDOWN_SEC:
+                    if click_target != "shake" and shake_state != "idle":
+                        _send_cmd(protocol.HOME, serial_port, udp_socket)  # release now; RPS sends nothing for ~3 s
+                        shake_state = "idle"
+                    if click_target == "home":
+                        game_state = "countdown"
+                        game_start_time = now
+                        game_user_move = "NONE"
+                        game_robot_move = "NONE"
+                        game_result = "NONE"
                         mimic_mode = False
-                        _send_cmd("MIMIC:STOP", serial_port, udp_socket)
-                    _send_cmd("MODE:GAME", serial_port, udp_socket)
-                elif click_target == "mode":
-                    mimic_mode = not mimic_mode
+                    elif click_target == "mode":
+                        mimic_mode = not mimic_mode
+                        game_state = "idle"
+                        game_user_move = "NONE"
+                        game_robot_move = "NONE"
+                        game_result = "NONE"
+                        if not mimic_mode:
+                            _send_cmd(protocol.HOME, serial_port, udp_socket)
+                    elif click_target == "pose" and game_state == "idle":
+                        mimic_mode = False
+                        pose_index = (pose_index + 1) % len(hand_model.DEMO_POSES)
+                        btn_pose.text = f"POSE {hand_model.DEMO_POSES[pose_index]}"
+                        send_pose(hand_model.DEMO_POSES[pose_index])
+                    elif click_target == "shake" and game_state == "idle" and shake_state == "idle":
+                        mimic_mode = False
+                        send_pose("OPEN")
+                        shake_state = "opening"
+                        shake_start = now
+                    click_countdown_active = False
+                    click_target = None
+
+            if shake_state == "opening" and (now - shake_start) >= HANDSHAKE_OPEN_SEC:
+                _send_cmd(protocol.grip(0xF, HANDSHAKE_LIMIT_MA, HANDSHAKE_STEP_DEG), serial_port, udp_socket)
+                shake_state = "gripping"
+                shake_start = now
+                last_heartbeat = now
+            elif shake_state == "gripping":
+                if (now - shake_start) >= HANDSHAKE_GRIP_SEC:
+                    _send_cmd(protocol.HOME, serial_port, udp_socket)
+                    shake_state = "idle"
+                elif (now - last_heartbeat) >= HANDSHAKE_HEARTBEAT_SEC:
+                    _send_cmd(protocol.PING, serial_port, udp_socket)
+                    last_heartbeat = now
+
+            if game_state == "countdown":
+                remaining = GAME_COUNTDOWN_SEC - (now - game_start_time)
+                if remaining <= 0 and game_user_move == "NONE":
+                    if control_landmarks is None:
+                        user_move = "NONE"
+                    else:
+                        user_move = _rps_from_landmarks(control_landmarks)
+                        if user_move == "UNKNOWN":
+                            user_move = "NONE"
+                    robot_move = random.choice(["ROCK", "PAPER", "SCISSORS"])
+                    game_user_move = user_move
+                    game_robot_move = robot_move
+                    game_result = _rps_winner(user_move, robot_move)
+                    send_pose(hand_model.RPS_POSE[robot_move])
+                    game_state = "reveal"
+                    game_start_time = now
+
+            if game_state == "reveal":
+                if (now - game_start_time) >= GAME_REVEAL_SEC:
                     game_state = "idle"
                     game_user_move = "NONE"
                     game_robot_move = "NONE"
                     game_result = "NONE"
-                    if mimic_mode:
-                        _send_cmd("MODE:MIMIC", serial_port, udp_socket)
-                    else:
-                        _send_cmd("MIMIC:STOP", serial_port, udp_socket)
-                        _send_cmd("MODE:IDLE", serial_port, udp_socket)
-                click_countdown_active = False
-                click_target = None
+                    if not mimic_mode:
+                        _send_cmd(protocol.HOME, serial_port, udp_socket)
 
-        if game_state == "countdown":
-            remaining = GAME_COUNTDOWN_SEC - (now - game_start_time)
-            if remaining <= 0 and game_user_move == "NONE":
-                if control_landmarks is None:
-                    user_move = "NONE"
+            if mimic_mode and game_state == "idle":
+                right_hand = _find_hand_by_label(hands_info, MIMIC_HAND_LABEL)
+                if right_hand is None and len(hands_info) == 1:
+                    right_hand = hands_info[0]["landmarks"]
+                if right_hand is not None:
+                    flex = [f.apply(v, dt) for f, v in zip(flex_filters, mimic.finger_flex(right_hand))]
+                    if (now - last_serial_send) >= SERIAL_SEND_INTERVAL:
+                        _send_cmd(protocol.angles(hand_model.to_servo_angles(flex)), serial_port, udp_socket)
+                        last_serial_send = now
+
+            btn_home.draw(debug_image)
+            btn_mode.draw(debug_image)
+            btn_pose.draw(debug_image)
+            btn_shake.draw(debug_image)
+            if shake_state != "idle":
+                label = "Put your hand in mine" if shake_state == "opening" else "Shaking..."
+                _draw_center_text(debug_image, label, int(h * 0.15), 1.0, (0, 255, 255), 2)
+
+            if cursor_pos is not None:
+                cursor_color = (0, 0, 255) if pinch_active else (0, 255, 0)
+                cv.circle(debug_image, cursor_pos, 10, cursor_color, -1 if pinch_active else 2)
+                if click_countdown_active:
+                    _draw_click_countdown(debug_image, cursor_pos, now - click_countdown_start, CLICK_COUNTDOWN_SEC)
+
+            status = "ENABLED" if control_enabled else "PAUSED"
+            cv.putText(debug_image, f"Control: {status}", (10, 30),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0) if control_enabled else (0, 0, 200), 2)
+            if pinch_active:
+                cv.putText(debug_image, "PINCH", (10, 60),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+            if mimic_mode:
+                cv.putText(debug_image, "MIMIC: ON", (10, 90),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
+            if control_label:
+                cv.putText(debug_image, f"Hand: {control_label}", (10, 120),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+
+            if game_state == "countdown":
+                remaining = GAME_COUNTDOWN_SEC - (now - game_start_time)
+                countdown_num = max(0, int(remaining) + 1)
+                _draw_center_text(debug_image, str(countdown_num), int(h * 0.5), 3.0, (0, 255, 255), 5)
+                _draw_center_text(debug_image, "Show gesture at 0", int(h * 0.5) + 60, 0.8, (255, 255, 255), 2)
+            elif game_state == "reveal":
+                _draw_center_text(debug_image, f"YOU: {game_user_move}", int(h * 0.45), 1.0, (255, 255, 255), 2)
+                _draw_center_text(debug_image, f"ROBOT: {game_robot_move}", int(h * 0.52), 1.0, (255, 255, 255), 2)
+                if game_result == "DRAW":
+                    result_text = "DRAW"
+                    result_color = (255, 255, 0)
+                elif game_result == "USER":
+                    result_text = "YOU WIN"
+                    result_color = (0, 255, 0)
                 else:
-                    user_move = _rps_from_landmarks(control_landmarks)
-                    if user_move == "UNKNOWN":
-                        user_move = "NONE"
-                robot_move = random.choice(["ROCK", "PAPER", "SCISSORS"])
-                game_user_move = user_move
-                game_robot_move = robot_move
-                game_result = _rps_winner(user_move, robot_move)
-                _send_cmd(f"RPS:{robot_move}", serial_port, udp_socket)
-                game_state = "reveal"
-                game_start_time = now
+                    result_text = "ROBOT WIN"
+                    result_color = (0, 0, 255)
+                _draw_center_text(debug_image, result_text, int(h * 0.62), 1.2, result_color, 3)
 
-        if game_state == "reveal":
-            if (now - game_start_time) >= GAME_REVEAL_SEC:
-                game_state = "idle"
-                game_user_move = "NONE"
-                game_robot_move = "NONE"
-                game_result = "NONE"
-                if not mimic_mode:
-                    _send_cmd("MODE:IDLE", serial_port, udp_socket)
-
-        if mimic_mode and game_state == "idle":
-            right_hand = _find_hand_by_label(hands_info, MIMIC_HAND_LABEL)
-            if right_hand is None and len(hands_info) == 1:
-                right_hand = hands_info[0]["landmarks"]
-            if right_hand is not None:
-                states = _finger_states(right_hand)
-                mimic_state = (
-                    states["thumb"],
-                    states["index"],
-                    states["middle"],
-                    states["ring"],
-                )
-                if mimic_state != last_mimic_state or (now - last_serial_send) >= SERIAL_SEND_INTERVAL:
-                    cmd = f"MIMIC:{int(mimic_state[0])}{int(mimic_state[1])}{int(mimic_state[2])}{int(mimic_state[3])}"
-                    _send_cmd(cmd, serial_port, udp_socket)
-                    last_mimic_state = mimic_state
-                    last_serial_send = now
-
-        btn_home.draw(debug_image)
-        btn_mode.draw(debug_image)
-
-        if cursor_pos is not None:
-            cursor_color = (0, 0, 255) if pinch_active else (0, 255, 0)
-            cv.circle(debug_image, cursor_pos, 10, cursor_color, -1 if pinch_active else 2)
-            if click_countdown_active:
-                _draw_click_countdown(debug_image, cursor_pos, now - click_countdown_start, CLICK_COUNTDOWN_SEC)
-
-        status = "ENABLED" if control_enabled else "PAUSED"
-        cv.putText(debug_image, f"Control: {status}", (10, 30),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0) if control_enabled else (0, 0, 200), 2)
-        if pinch_active:
-            cv.putText(debug_image, "PINCH", (10, 60),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
-        if mimic_mode:
-            cv.putText(debug_image, "MIMIC: ON", (10, 90),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
-        if control_label:
-            cv.putText(debug_image, f"Hand: {control_label}", (10, 120),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-
-        if game_state == "countdown":
-            remaining = GAME_COUNTDOWN_SEC - (now - game_start_time)
-            countdown_num = max(0, int(remaining) + 1)
-            _draw_center_text(debug_image, str(countdown_num), int(h * 0.5), 3.0, (0, 255, 255), 5)
-            _draw_center_text(debug_image, "Show gesture at 0", int(h * 0.5) + 60, 0.8, (255, 255, 255), 2)
-        elif game_state == "reveal":
-            _draw_center_text(debug_image, f"YOU: {game_user_move}", int(h * 0.45), 1.0, (255, 255, 255), 2)
-            _draw_center_text(debug_image, f"ROBOT: {game_robot_move}", int(h * 0.52), 1.0, (255, 255, 255), 2)
-            if game_result == "DRAW":
-                result_text = "DRAW"
-                result_color = (255, 255, 0)
-            elif game_result == "USER":
-                result_text = "YOU WIN"
-                result_color = (0, 255, 0)
-            else:
-                result_text = "ROBOT WIN"
-                result_color = (0, 0, 255)
-            _draw_center_text(debug_image, result_text, int(h * 0.62), 1.2, result_color, 3)
-
-        cv.imshow("Hand Tracking GUI (Demo Style)", debug_image)
-        if cv.waitKey(1) & 0xFF == 27:
-            break
-
-    if use_tasks_api and landmarker is not None:
-        landmarker.close()
-    elif hands is not None:
-        hands.close()
-    if serial_port is not None:
-        serial_port.close()
-    if udp_socket is not None:
-        udp_socket.close()
-    cap.release()
-    cv.destroyAllWindows()
+            cv.imshow("Hand Tracking GUI (Demo Style)", debug_image)
+            key = cv.waitKey(1) & 0xFF
+            if key == 27:
+                break
+            if ord("1") <= key <= ord("5") and game_state == "idle":  # keyboard shortcut for the 5 demo poses
+                mimic_mode = False
+                shake_state = "idle"  # the pose's A: below cancels GRIP and moves the hand, so no extra HOME
+                pose_index = key - ord("1")
+                btn_pose.text = f"POSE {hand_model.DEMO_POSES[pose_index]}"
+                send_pose(hand_model.DEMO_POSES[pose_index])
+    finally:
+        try:
+            _send_cmd(protocol.HOME, serial_port, udp_socket)  # never leave the hand closed (e.g. Esc mid-handshake)
+        except Exception as e:  # a failed send must not hide the original exception
+            print(f"[EXIT] could not send HOME: {e}")
+        if use_tasks_api and landmarker is not None:
+            landmarker.close()
+        elif hands is not None:
+            hands.close()
+        if serial_port is not None:
+            serial_port.close()
+        if udp_socket is not None:
+            udp_socket.close()
+        if SIM is not None:
+            SIM.close()
+        cap.release()
+        cv.destroyAllWindows()
 
 
 if __name__ == "__main__":
