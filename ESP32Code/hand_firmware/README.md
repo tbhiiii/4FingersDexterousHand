@@ -23,6 +23,15 @@ Copy-Item secrets.example.h secrets.h   # then edit
 
 Wiring: servos on PCA9685 channels 0–7 (servo index = channel), servo power on the PCA9685 `V+` terminal. Two I2C buses, so both boards keep the default address `0x40` and nothing needs soldering: PCA9685 on SDA 21 / SCL 22, INA219 on SDA 18 / SCL 19. Both boards' `VCC` to ESP32 3V3, all grounds common. If the PCA9685 doesn't answer at boot, serial prints `INFO:NOPCA9685` and nothing moves.
 
+Finding dead servos: with servo power on, run `AmazingHand_GUIDesign/servo_check.py`. It moves one servo at a time
+and reads the INA219: a turning servo adds a few hundred mA, a dead one or a loose plug adds nothing.
+
+```powershell
+cd AmazingHand_GUIDesign
+.venv\Scripts\python servo_check.py --port COM6            # channels 0-7 one at a time
+.venv\Scripts\python servo_check.py --port COM6 --swap 0   # plug each servo into ch0 in turn: tells servo from channel
+```
+
 Done:
 - `PING`, `A:`, `HOME`, `STOP`, `STATUS` and `ERR:`, with angles clamped.
 - The hand moves to home at boot.
